@@ -64,13 +64,17 @@ contract CampaignRegistry is Ownable, Pausable {
         _;
     }
 
+    function getCampaign(uint256 campaignId) external view returns (Campaign memory) {
+        return campaigns[campaignId];
+    }   
+
     function updateSignerAddress(address _newSignerAddress) external onlyOwner {
         signerAddress = _newSignerAddress;
         emit SignerAddressUpdated(_newSignerAddress);
     }
 
     function publishCampaign(
-        uint64 campaignId,
+        uint256 campaignId,
         string memory name,
         string memory description,
         uint64 startTime,
@@ -133,7 +137,7 @@ contract CampaignRegistry is Ownable, Pausable {
         if (campaigns[campaignId].totalPointsAllocated != 0) revert CampaignAlreadySettled();
         if (achievedMilestoneReward > campaigns[campaignId].campaignBudget) revert CampaignBudgetExceeded();
 
-        // Verify signature (Allow reward allocation only from protocol Dapp )
+        // Verify signature (Allow reward allocation only from protocol Dapp UI )
         bytes32 message = keccak256(abi.encodePacked(campaignId, merkleRoot, totalPointsAllocated, achievedMilestoneReward));
         bytes32 signedMessage = message.toEthSignedMessageHash();
         if (signedMessage.recover(signature) != signerAddress) revert InvalidSignature();
@@ -151,7 +155,7 @@ contract CampaignRegistry is Ownable, Pausable {
         address token = campaigns[campaignId].rewardToken;
         address owner = campaigns[campaignId].campaignOwner;
 
-        // Verify signature (Allow cancel campaaign only from protocol Dapp )
+        // Verify signature (Allow cancel campaaign only from protocol Dapp UI )
         bytes32 message = keccak256(abi.encodePacked(campaignId));
         bytes32 signedMessage = message.toEthSignedMessageHash();
         if (signedMessage.recover(signature) != signerAddress) revert InvalidSignature();
@@ -163,9 +167,7 @@ contract CampaignRegistry is Ownable, Pausable {
         emit CampaignCancelled(campaignId);
     }
 
-    function getCampaign(uint256 campaignId) external view returns (Campaign memory) {
-        return campaigns[campaignId];
-    }   
+    
 
     function withdrawExtraBudget(uint256 campaignId) external onlyCampaignOwner(campaignId) whenNotPaused {
         if (campaigns[campaignId].totalPointsAllocated == 0) revert CampaignNotSettled();
