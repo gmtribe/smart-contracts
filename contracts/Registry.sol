@@ -100,6 +100,8 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         if (startTime <= block.timestamp) revert InvalidTimeRange();
         if (endTime - startTime < MIN_CAMPAIGN_DURATION || endTime - startTime > MAX_CAMPAIGN_DURATION) revert InvalidTimeRange();
 
+        if (!IERC20(rewardToken).transferFrom(msg.sender, address(this), campaignBudget)) revert TransferFailed();
+
         campaigns[campaignId] = Campaign({
             name: name,
             startTime: startTime,
@@ -114,7 +116,6 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
             extraBudgetWithdrawn: false
         });
 
-        if (!IERC20(rewardToken).transferFrom(msg.sender, address(this), campaignBudget)) revert TransferFailed();
         emit CampaignPublished(campaignId, name, description, startTime, endTime, rewardToken, campaignBudget, msg.sender);
     }
 
