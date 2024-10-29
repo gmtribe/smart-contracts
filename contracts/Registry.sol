@@ -7,8 +7,11 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 
+
+error InvalidAddress();
 error CampaignNotFound();
 error RewardAlreadyClaimed();
 error CampaignNotSettled();
@@ -22,31 +25,35 @@ error TransferFailed();
 error InvalidTimeRange();
 error OnlyCampaignOwner();
 error CampaignAlreadyExists();
+error ExtraBudgetAlreadyWithdrawn();
+
 
 struct Campaign {
     string name;
-    string description;
     uint64 startTime;
     uint64 endTime;
-    uint256 totalPointsAllocated;
     address rewardToken;
+    address campaignOwner;
+    bool extraBudgetWithdrawn;
     uint256 campaignBudget;
     bytes32 merkleRoot;
     uint256 achievedMilestoneReward;
     uint256 totalAmountClaimed;
-    address campaignOwner;
+    uint256 totalPointsAllocated;
 }
 
 
-contract CampaignRegistry is Ownable, Pausable {
+contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
     using ECDSA for bytes32;
     using MessageHashUtils for bytes32;
 
     mapping(uint256 => Campaign) public campaigns;
-    mapping(uint256 => mapping(string => bool)) private claimedRewards;
+    mapping(uint256 => mapping(string => bool)) public claimedRewards;
 
     address public signerAddress;
 
+    uint256 public constant MIN_CAMPAIGN_DURATION = 1 days;
+    uint256 public constant MAX_CAMPAIGN_DURATION = 365 days;
 
     event RewardClaimed(uint256 indexed campaignId, address indexed recipient, string indexed twitterUserId, address rewardToken, uint256 amount);
     event SignerAddressUpdated(address newSignerAddress);
@@ -54,9 +61,16 @@ contract CampaignRegistry is Ownable, Pausable {
     event CampaignSettled(uint256 indexed campaignId, bytes32 merkleRoot, uint256 totalPointsAllocated, uint256 achievedMilestoneReward);
     event CampaignCancelled(uint256 indexed campaignId);
     event ExtraBudgetWithdrawn(uint256 indexed campaignId, address rewardToken, uint256 amount);
+    event BudgetAdded(uint256 indexed campaignId, address rewardToken, uint256 newBudget);
 
     constructor(address _initialOwner, address _signerAddress) Ownable(_initialOwner) {
+        if (_initialOwner == address(0) || _signerAddress == address(0)) revert InvalidAddress();
         signerAddress = _signerAddress;
+    }
+
+    modifier campaignExists(uint256 campaignId) {
+        if (campaigns[campaignId].startTime == 0) revert CampaignNotFound();
+        _;
     }
 
     modifier onlyCampaignOwner(uint256 campaignId) {
@@ -69,6 +83,7 @@ contract CampaignRegistry is Ownable, Pausable {
     }   
 
     function updateSignerAddress(address _newSignerAddress) external onlyOwner {
+        if (_newSignerAddress == address(0)) revert InvalidAddress();
         signerAddress = _newSignerAddress;
         emit SignerAddressUpdated(_newSignerAddress);
     }
@@ -82,12 +97,11 @@ contract CampaignRegistry is Ownable, Pausable {
         address rewardToken,
         uint256 campaignBudget ) external whenNotPaused {
         if (campaigns[campaignId].startTime != 0) revert CampaignAlreadyExists();
-        if (startTime >= endTime) revert InvalidTimeRange();
         if (startTime <= block.timestamp) revert InvalidTimeRange();
+        if (endTime - startTime < MIN_CAMPAIGN_DURATION || endTime - startTime > MAX_CAMPAIGN_DURATION) revert InvalidTimeRange();
 
         campaigns[campaignId] = Campaign({
             name: name,
-            description: description,
             startTime: startTime,
             endTime: endTime,
             totalPointsAllocated: 0,
@@ -96,7 +110,8 @@ contract CampaignRegistry is Ownable, Pausable {
             merkleRoot: bytes32(0),
             achievedMilestoneReward: 0,
             totalAmountClaimed: 0,
-            campaignOwner: msg.sender
+            campaignOwner: msg.sender,
+            extraBudgetWithdrawn: false
         });
 
         if (!IERC20(rewardToken).transferFrom(msg.sender, address(this), campaignBudget)) revert TransferFailed();
@@ -110,50 +125,53 @@ contract CampaignRegistry is Ownable, Pausable {
         uint256 amount,
         bytes32[] calldata merkleProof,
         bytes memory signature
-    ) external whenNotPaused{
+    ) external whenNotPaused campaignExists(campaignId) nonReentrant{
+        Campaign storage campaign = campaigns[campaignId];
         if (claimedRewards[campaignId][twitterUserId]) revert RewardAlreadyClaimed();
-        if (campaigns[campaignId].merkleRoot == bytes32(0)) revert CampaignNotSettled();
+        if (campaign.merkleRoot == bytes32(0)) revert CampaignNotSettled();
+
+        // Verify Merkle proof
+        bytes32 leaf = keccak256(abi.encodePacked(twitterUserId,":", amount));
+        if (!MerkleProof.verify(merkleProof, campaign.merkleRoot, leaf)) revert InvalidMerkleProof();
 
         // Verify signature
-        bytes32 message = keccak256(abi.encodePacked(campaignId, recipient, amount));
+        bytes32 message = keccak256(abi.encodePacked(campaignId, recipient, amount, merkleProof));
         bytes32 signedMessage = message.toEthSignedMessageHash();
         if (signedMessage.recover(signature) != signerAddress) revert InvalidSignature();
 
-        // Verify Merkle proof
-        bytes32 leaf = keccak256(abi.encodePacked(twitterUserId, amount));
-        if (!MerkleProof.verify(merkleProof, campaigns[campaignId].merkleRoot, leaf)) revert InvalidMerkleProof();
-
         // Mark as claimed and transfer reward
         claimedRewards[campaignId][twitterUserId] = true;
-        campaigns[campaignId].totalAmountClaimed += amount;
-        if (campaigns[campaignId].totalAmountClaimed > campaigns[campaignId].achievedMilestoneReward) revert InsufficientRewards();
-        if (!IERC20(campaigns[campaignId].rewardToken).transfer(recipient, amount)) revert TransferFailed();
+        campaign.totalAmountClaimed += amount;
+        if (campaign.totalAmountClaimed > campaign.achievedMilestoneReward) revert InsufficientRewards();
+        if (!IERC20(campaign.rewardToken).transfer(recipient, amount)) revert TransferFailed();
 
-        emit RewardClaimed(campaignId,recipient, twitterUserId, campaigns[campaignId].rewardToken, amount);
+        emit RewardClaimed(campaignId,recipient, twitterUserId, campaign.rewardToken, amount);
     }
 
-    function settleCampaign(uint256 campaignId, bytes32 merkleRoot, uint256 totalPointsAllocated, uint256 achievedMilestoneReward, bytes memory signature) external onlyCampaignOwner(campaignId) whenNotPaused {
-        if (campaigns[campaignId].endTime > block.timestamp) revert CampaignStillActive();
-        if (campaigns[campaignId].totalPointsAllocated != 0) revert CampaignAlreadySettled();
-        if (achievedMilestoneReward > campaigns[campaignId].campaignBudget) revert CampaignBudgetExceeded();
+    function settleCampaign(uint256 campaignId, bytes32 merkleRoot, uint256 totalPointsAllocated, uint256 achievedMilestoneReward, bytes memory signature) external onlyCampaignOwner(campaignId)  whenNotPaused {
+        Campaign storage campaign = campaigns[campaignId];
+        if (campaign.endTime > block.timestamp) revert CampaignStillActive();
+        if (campaign.merkleRoot != bytes32(0)) revert CampaignAlreadySettled();
+        if (achievedMilestoneReward > campaign.campaignBudget) revert CampaignBudgetExceeded();
 
         // Verify signature (Allow reward allocation only from protocol Dapp UI )
         bytes32 message = keccak256(abi.encodePacked(campaignId, merkleRoot, totalPointsAllocated, achievedMilestoneReward));
         bytes32 signedMessage = message.toEthSignedMessageHash();
         if (signedMessage.recover(signature) != signerAddress) revert InvalidSignature();
 
-        campaigns[campaignId].merkleRoot = merkleRoot;
-        campaigns[campaignId].totalPointsAllocated = totalPointsAllocated;
-        campaigns[campaignId].achievedMilestoneReward = achievedMilestoneReward;
+        campaign.merkleRoot = merkleRoot;
+        campaign.totalPointsAllocated = totalPointsAllocated;
+        campaign.achievedMilestoneReward = achievedMilestoneReward;
         emit CampaignSettled(campaignId, merkleRoot, totalPointsAllocated, achievedMilestoneReward);
     }
 
-    function cancelCampaign(uint256 campaignId, bytes memory signature) external onlyCampaignOwner(campaignId) whenNotPaused {
-        if (campaigns[campaignId].startTime <= block.timestamp) revert CampaignStillActive();
+    function cancelCampaign(uint256 campaignId, bytes memory signature) external onlyCampaignOwner(campaignId) whenNotPaused nonReentrant{
+        Campaign memory campaign = campaigns[campaignId];
+        if (campaign.startTime <= block.timestamp) revert CampaignStillActive();
         
-        uint256 budget = campaigns[campaignId].campaignBudget;
-        address token = campaigns[campaignId].rewardToken;
-        address owner = campaigns[campaignId].campaignOwner;
+        uint256 budget = campaign.campaignBudget;
+        address token = campaign.rewardToken;
+        address owner = campaign.campaignOwner;
 
         // Verify signature (Allow cancel campaaign only from protocol Dapp UI )
         bytes32 message = keccak256(abi.encodePacked(campaignId));
@@ -167,14 +185,27 @@ contract CampaignRegistry is Ownable, Pausable {
         emit CampaignCancelled(campaignId);
     }
 
-    
 
-    function withdrawExtraBudget(uint256 campaignId) external onlyCampaignOwner(campaignId) whenNotPaused {
-        if (campaigns[campaignId].totalPointsAllocated == 0) revert CampaignNotSettled();
-        uint256 extraBudget = campaigns[campaignId].campaignBudget - campaigns[campaignId].achievedMilestoneReward;
-        if (!IERC20(campaigns[campaignId].rewardToken).transfer(campaigns[campaignId].campaignOwner, extraBudget)) revert TransferFailed();
+    function withdrawExtraBudget(uint256 campaignId) external onlyCampaignOwner(campaignId) whenNotPaused nonReentrant{
+        Campaign storage campaign = campaigns[campaignId];
+        if (campaign.merkleRoot == bytes32(0)) revert CampaignNotSettled();
+        if (campaign.extraBudgetWithdrawn) revert ExtraBudgetAlreadyWithdrawn();
+        uint256 extraBudget = campaign.campaignBudget - campaign.achievedMilestoneReward;
 
-        emit ExtraBudgetWithdrawn(campaignId, campaigns[campaignId].rewardToken, extraBudget);
+        campaign.extraBudgetWithdrawn = true;
+        if (!IERC20(campaign.rewardToken).transfer(campaign.campaignOwner, extraBudget)) revert TransferFailed();
+
+        emit ExtraBudgetWithdrawn(campaignId, campaign.rewardToken, extraBudget);
+    }
+
+    function addBudget(uint256 campaignId, uint256 extraBudget) external onlyCampaignOwner(campaignId) whenNotPaused {
+        Campaign storage campaign = campaigns[campaignId];
+        if (campaign.merkleRoot != bytes32(0)) revert CampaignAlreadySettled();
+
+        if (!IERC20(campaign.rewardToken).transferFrom(msg.sender, address(this), extraBudget)) revert TransferFailed();
+        campaign.campaignBudget += extraBudget;
+
+        emit BudgetAdded(campaignId, campaign.rewardToken, campaign.campaignBudget);
     }
 
     function pause() external onlyOwner {
