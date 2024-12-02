@@ -15,6 +15,8 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 error InvalidAddress();
 /// @notice Campaign with the specified ID does not exist
 error CampaignNotFound();
+/// @notice Invalid fee percentage provided
+error InvalidFeePercentage();
 /// @notice Reward has already been claimed for this user
 error RewardAlreadyClaimed();
 /// @notice Campaign has not been settled yet
@@ -83,6 +85,11 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Address of the signer used to verify signatures
     address public signerAddress;
+ 
+    /// @notice Fee percentage in basis points (1/100th of a percent)
+    uint256 public feePercentage = 5; 
+    /// @notice Address of the recipient for collected fees (address(0) means fees disabled)
+    address public feeRecipient = address(0);
 
     /// @notice Emitted when a reward is claimed from a campaign
     /// @param campaignId ID of the campaign
@@ -95,6 +102,14 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
     /// @notice Emitted when the signer address is updated
     /// @param newSignerAddress New address authorized to sign operations
     event SignerAddressUpdated(address newSignerAddress);
+
+    /// @notice Emitted when the fee recipient is updated
+    /// @param newFeeRecipient New fee recipient address
+    event FeeRecipientUpdated(address newFeeRecipient);
+
+    /// @notice Emitted when the fee percentage is updated
+    /// @param newFeePercentage New fee percentage in basis points (1/100th of a percent)
+    event FeePercentageUpdated(uint256 newFeePercentage);
 
     /// @notice Emitted when a campaign ownership is transferred
     /// @param campaignId ID of the campaign
@@ -177,6 +192,23 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         emit SignerAddressUpdated(_newSignerAddress);
     }
 
+    /// @notice Updates the address of the recipient for collected fees
+    /// @param _newFeeRecipient New fee recipient address
+    /// @dev Only the registry owner can update the fee recipient
+    function updateFeeRecipient(address _newFeeRecipient) external onlyOwner {
+        feeRecipient = _newFeeRecipient;
+        emit FeeRecipientUpdated(_newFeeRecipient);
+    }
+
+    /// @notice Updates the fee percentage
+    /// @param _newFeePercentage New fee percentage in basis points (1/100th of a percent)
+    /// @dev Only the registry owner can update the fee percentage (Max: 10%)
+    function updateFeePercentage(uint256 _newFeePercentage) external onlyOwner {
+        if (_newFeePercentage > 10) revert InvalidFeePercentage();
+        feePercentage = _newFeePercentage;
+        emit FeePercentageUpdated(_newFeePercentage);
+    }
+
     /// @notice Transfers campaign ownership to a new address
     /// @param campaignId ID of the campaign
     /// @param newOwner Address of the new campaign owner
@@ -204,8 +236,13 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         address rewardToken,
         uint256 campaignBudget ) external whenNotPaused {
         if (campaigns[campaignId].startTime != 0) revert CampaignAlreadyExists();
-        if (startTime <= block.timestamp || endTime > startTime) revert InvalidTimeRange();
+        if (startTime <= block.timestamp || endTime <= startTime) revert InvalidTimeRange();
 
+        if (feeRecipient != address(0)) {
+            uint256 feeAmount = (campaignBudget * feePercentage) / 100;
+            IERC20(rewardToken).safeTransferFrom(msg.sender, feeRecipient, feeAmount);
+            campaignBudget -= feeAmount;
+        }
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), campaignBudget);
 
         campaigns[campaignId] = Campaign({
