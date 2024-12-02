@@ -83,10 +83,6 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Address of the signer used to verify signatures
     address public signerAddress;
-    /// @notice Minimum duration allowed for a campaign (1 day)
-    uint256 public constant MIN_CAMPAIGN_DURATION = 1 days;
-    /// @notice Maximum duration allowed for a campaign (365 days)
-    uint256 public constant MAX_CAMPAIGN_DURATION = 365 days;
 
     /// @notice Emitted when a reward is claimed from a campaign
     /// @param campaignId ID of the campaign
@@ -99,6 +95,11 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
     /// @notice Emitted when the signer address is updated
     /// @param newSignerAddress New address authorized to sign operations
     event SignerAddressUpdated(address newSignerAddress);
+
+    /// @notice Emitted when a campaign ownership is transferred
+    /// @param campaignId ID of the campaign
+    /// @param newOwner Address of the new campaign owner
+    event CampaignOwnershipTransferred(uint256 indexed campaignId, address indexed newOwner);
     
     /// @notice Emitted when a new campaign is published
     /// @param campaignId ID of the campaign
@@ -176,6 +177,16 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         emit SignerAddressUpdated(_newSignerAddress);
     }
 
+    /// @notice Transfers campaign ownership to a new address
+    /// @param campaignId ID of the campaign
+    /// @param newOwner Address of the new campaign owner
+    /// @dev Only the current campaign owner can transfer ownership
+    function transferCampaignOwnership(uint256 campaignId, address newOwner) external onlyCampaignOwner(campaignId) {
+        campaigns[campaignId].campaignOwner = newOwner;
+
+        emit CampaignOwnershipTransferred(campaignId, newOwner);
+    }
+
     /// @notice Publishes a new campaign
     /// @param campaignId ID for the new campaign
     /// @param name Name of the campaign
@@ -193,8 +204,7 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         address rewardToken,
         uint256 campaignBudget ) external whenNotPaused {
         if (campaigns[campaignId].startTime != 0) revert CampaignAlreadyExists();
-        if (startTime <= block.timestamp) revert InvalidTimeRange();
-        if (endTime - startTime < MIN_CAMPAIGN_DURATION || endTime - startTime > MAX_CAMPAIGN_DURATION) revert InvalidTimeRange();
+        if (startTime <= block.timestamp || endTime > startTime) revert InvalidTimeRange();
 
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), campaignBudget);
 
