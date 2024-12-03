@@ -41,7 +41,10 @@ error OnlyCampaignOwner();
 error CampaignAlreadyExists();
 /// @notice Extra budget has already been withdrawn
 error ExtraBudgetAlreadyWithdrawn();
-
+/// @notice No unclaimed budget to withdraw
+error NoUnclaimedBudget();
+/// @notice Claim window has not ended yet
+error ClaimWindowNotOver();
 
 /// @notice Campaign struct containing all campaign details
 /// @param name Name of the campaign
@@ -85,8 +88,10 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Address of the signer used to verify signatures
     address public signerAddress;
- 
-    /// @notice Fee percentage in basis points (1/100th of a percent)
+    /// @notice Claim window in seconds
+    uint256 public claimWindow = 90 days; // 3 months
+
+    /// @notice Fee percentage (100 = 100%)
     uint256 public feePercentage = 5; 
     /// @notice Address of the recipient for collected fees (address(0) means fees disabled)
     address public feeRecipient = address(0);
@@ -111,6 +116,10 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
     /// @param newFeePercentage New fee percentage in basis points (1/100th of a percent)
     event FeePercentageUpdated(uint256 newFeePercentage);
 
+    /// @notice Emitted when the claim window is updated
+    /// @param newClaimWindow New claim window in seconds
+    event ClaimWindowUpdated(uint256 newClaimWindow);
+
     /// @notice Emitted when a campaign ownership is transferred
     /// @param campaignId ID of the campaign
     /// @param newOwner Address of the new campaign owner
@@ -134,6 +143,18 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
     /// @param achievedMilestoneReward Total rewards to be distributed based on achieved milestones
     event CampaignSettled(uint256 indexed campaignId, bytes32 merkleRoot, uint256 totalPointsAllocated, uint256 achievedMilestoneReward);
     
+    /// @notice Emitted when fee is collected from a campaign
+    /// @param campaignId ID of the campaign
+    /// @param feeRecipient Address of the fee recipient
+    /// @param feeAmount Amount of fee collected
+    event FeeCollected(uint256 indexed campaignId, address indexed feeRecipient, uint256 feeAmount);
+
+    /// @notice Emitted when unclaimed budget is withdrawn
+    /// @param campaignId ID of the campaign
+    /// @param rewardToken Address of the reward token
+    /// @param amount Amount of tokens withdrawn
+    event UnclaimedBudgetWithdrawn(uint256 indexed campaignId, address rewardToken, uint256 amount);
+
     /// @notice Emitted when a campaign is cancelled
     /// @param campaignId ID of the cancelled campaign
     /// @param campaignOwner Address of the campaign owner
@@ -209,6 +230,13 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         emit FeePercentageUpdated(_newFeePercentage);
     }
 
+    /// @notice Updates the claim window
+    /// @param _newClaimWindow New claim window in seconds
+    function updateClaimWindow(uint256 _newClaimWindow) external onlyOwner {
+        claimWindow = _newClaimWindow;
+        emit ClaimWindowUpdated(_newClaimWindow);
+    }
+
     /// @notice Transfers campaign ownership to a new address
     /// @param campaignId ID of the campaign
     /// @param newOwner Address of the new campaign owner
@@ -238,11 +266,6 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         if (campaigns[campaignId].startTime != 0) revert CampaignAlreadyExists();
         if (startTime <= block.timestamp || endTime <= startTime) revert InvalidTimeRange();
 
-        if (feeRecipient != address(0)) {
-            uint256 feeAmount = (campaignBudget * feePercentage) / 100;
-            IERC20(rewardToken).safeTransferFrom(msg.sender, feeRecipient, feeAmount);
-            campaignBudget -= feeAmount;
-        }
         IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), campaignBudget);
 
         campaigns[campaignId] = Campaign({
@@ -304,7 +327,7 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
     /// @param totalPointsAllocated Total points allocated in the campaign
     /// @param achievedMilestoneReward Total rewards to be distributed based on achieved milestones
     /// @param signature Signature from authorized signer
-    function settleCampaign(uint256 campaignId, bytes32 merkleRoot, uint256 totalPointsAllocated, uint256 achievedMilestoneReward, bytes memory signature) external onlyCampaignOwner(campaignId)  whenNotPaused {
+    function settleCampaign(uint256 campaignId, bytes32 merkleRoot, uint256 totalPointsAllocated, uint256 achievedMilestoneReward, bytes memory signature) external onlyCampaignOwner(campaignId) whenNotPaused nonReentrant {
         Campaign storage campaign = campaigns[campaignId];
         if (campaign.endTime > block.timestamp) revert CampaignStillActive();
         if (campaign.merkleRoot != bytes32(0)) revert CampaignAlreadySettled();
@@ -314,6 +337,21 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         bytes32 message = keccak256(abi.encodePacked(campaignId, merkleRoot, totalPointsAllocated, achievedMilestoneReward));
         bytes32 signedMessage = message.toEthSignedMessageHash();
         if (signedMessage.recover(signature) != signerAddress) revert InvalidSignature();
+
+        // reverting unused budget to campaign owner
+        uint256 extraBudget = campaign.campaignBudget - campaign.achievedMilestoneReward;
+        if (extraBudget > 0) {
+            IERC20(campaign.rewardToken).safeTransfer(campaign.campaignOwner, extraBudget);
+            emit ExtraBudgetWithdrawn(campaignId, campaign.rewardToken, extraBudget);
+        }
+
+        // Collecting fee from campaign (if enabled)
+        if (feeRecipient != address(0)) {
+            uint256 feeAmount = (achievedMilestoneReward * feePercentage) / 100;
+            IERC20(campaign.rewardToken).safeTransferFrom(msg.sender, feeRecipient, feeAmount);
+            achievedMilestoneReward -= feeAmount;
+            emit FeeCollected(campaignId, feeRecipient, feeAmount);
+        }
 
         campaign.merkleRoot = merkleRoot;
         campaign.totalPointsAllocated = totalPointsAllocated;
@@ -344,18 +382,20 @@ contract CampaignRegistry is Ownable, Pausable, ReentrancyGuard {
         emit CampaignCancelled(campaignId, owner, budget);
     }
 
-    /// @notice Withdraws unused budget after campaign settlement
+    /// @notice Withdraws unclaimed budget after campaign claim window ends
     /// @param campaignId ID of the campaign
-    function withdrawExtraBudget(uint256 campaignId) external onlyCampaignOwner(campaignId) whenNotPaused nonReentrant{
+    function withdrawUnclaimedBudget(uint256 campaignId) external onlyCampaignOwner(campaignId) whenNotPaused nonReentrant{
         Campaign storage campaign = campaigns[campaignId];
         if (campaign.merkleRoot == bytes32(0)) revert CampaignNotSettled();
-        if (campaign.extraBudgetWithdrawn) revert ExtraBudgetAlreadyWithdrawn();
-        uint256 extraBudget = campaign.campaignBudget - campaign.achievedMilestoneReward;
+        if (campaign.totalAmountClaimed == campaign.achievedMilestoneReward) revert NoUnclaimedBudget();
+        if (block.timestamp < campaign.endTime + claimWindow) revert ClaimWindowNotOver();
 
-        campaign.extraBudgetWithdrawn = true;
-        IERC20(campaign.rewardToken).safeTransfer(campaign.campaignOwner, extraBudget);
+        uint256 unclaimedBudget = campaign.achievedMilestoneReward - campaign.totalAmountClaimed;
+
+        campaign.totalAmountClaimed += unclaimedBudget;
+        IERC20(campaign.rewardToken).safeTransfer(campaign.campaignOwner, unclaimedBudget);
         
-        emit ExtraBudgetWithdrawn(campaignId, campaign.rewardToken, extraBudget);
+        emit UnclaimedBudgetWithdrawn(campaignId, campaign.rewardToken, unclaimedBudget);
     }
 
     /// @notice Adds additional budget to a campaign before settlement (any sponsor can add budget)
